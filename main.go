@@ -7,80 +7,109 @@ import (
 	"strings"
 	"time"
 
-	mcp "github.com/metoro-io/mcp-golang"
-	mcp_stdio "github.com/metoro-io/mcp-golang/transport/stdio"
-
 	"github.com/Alfex4936/kospell/kospell"
+	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
 )
-
-// ─────────────────────────────────────────────────────────────
-// Request payload shared by all tools
-type TextRequest struct {
-	Text string `json:"text" jsonschema:"required,description=Korean text to analyze"`
-}
 
 // ─────────────────────────────────────────────────────────────
 // Entry point
 func main() {
-	done := make(chan struct{}) // 이렇게 해야 long running
-
-	server := mcp.NewServer(mcp_stdio.NewStdioServerTransport())
+	// Create a new MCP server
+	s := server.NewMCPServer(
+		"kogrammar",
+		"1.0.0",
+	)
 
 	// 1) 글자‧어절 수 세기
-	must(server.RegisterTool(
-		"count_korean_letters",
-		"Count Korean UTF-8 runes and eojeols(어절)",
-		func(req TextRequest) (*mcp.ToolResponse, error) {
-			runes := len([]rune(req.Text))
-			words := len(strings.Fields(req.Text))
-			msg := fmt.Sprintf("총 글자 수: %d자\n총 어절 수: %d어절", runes, words)
-			return mcp.NewToolResponse(mcp.NewTextContent(msg)), nil
-		},
-	))
+	countLettersTool := mcp.NewTool("count_korean_letters",
+		mcp.WithDescription("Count Korean UTF-8 runes and eojeols(어절)"),
+		mcp.WithString("text",
+			mcp.Required(),
+			mcp.Description("Korean text to analyze"),
+		),
+	)
+	s.AddTool(countLettersTool, countKoreanLettersHandler)
 
 	// 2) 맞춤법 검사
-	must(server.RegisterTool(
-		"check_korean_grammar",
-		"Korean grammar / spelling checker using kospell",
-		func(req TextRequest) (*mcp.ToolResponse, error) {
-			report, err := kospellReport(req.Text)
-			if err != nil {
-				return nil, err
-			}
-			return mcp.NewToolResponse(mcp.NewTextContent(report)), nil
-		},
-	))
+	checkGrammarTool := mcp.NewTool("check_korean_grammar",
+		mcp.WithDescription("Korean grammar / spelling checker using kospell"),
+		mcp.WithString("text",
+			mcp.Required(),
+			mcp.Description("Korean text to analyze"),
+		),
+	)
+	s.AddTool(checkGrammarTool, checkKoreanGrammarHandler)
 
 	// 3) 이력서 전용 통합 툴 (글자 수 + 맞춤법)
-	must(server.RegisterTool(
-		"resume_review",
-		"Resume-oriented review: length limit + spelling feedback",
-		func(req TextRequest) (*mcp.ToolResponse, error) {
+	resumeReviewTool := mcp.NewTool("resume_review",
+		mcp.WithDescription("Resume-oriented review: length limit + spelling feedback"),
+		mcp.WithString("text",
+			mcp.Required(),
+			mcp.Description("Korean text to analyze"),
+		),
+	)
+	s.AddTool(resumeReviewTool, resumeReviewHandler)
 
-			// ① 글자 수
-			runeCnt := len([]rune(req.Text))
-			charLine := fmt.Sprintf("🔢 글자 수: %d자", runeCnt)
+	// Start the stdio server
+	if err := server.ServeStdio(s); err != nil {
+		log.Fatalf("Server error: %v\n", err)
+	}
+}
 
-			// ② 맞춤법
-			grammarLine, err := kospellReport(req.Text)
-			if err != nil {
-				return nil, err
-			}
+// ─────────────────────────────────────────────────────────────
+// Handlers
 
-			// ③ 종합 메시지
-			var sb strings.Builder
-			sb.WriteString(charLine)
-			sb.WriteString("\n\n")
-			sb.WriteString(grammarLine)
+func countKoreanLettersHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	text, err := request.RequireString("text")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
 
-			return mcp.NewToolResponse(mcp.NewTextContent(sb.String())), nil
-		},
-	))
+	runes := len([]rune(text))
+	words := len(strings.Fields(text))
+	msg := fmt.Sprintf("총 글자 수: %d자\n총 어절 수: %d어절", runes, words)
 
-	// Start MCP server (stdio)
-	must(server.Serve())
+	return mcp.NewToolResultText(msg), nil
+}
 
-	<-done
+func checkKoreanGrammarHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	text, err := request.RequireString("text")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	report, err := kospellReport(text)
+	if err != nil {
+		return nil, err // Returning a top-level error
+	}
+
+	return mcp.NewToolResultText(report), nil
+}
+
+func resumeReviewHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	text, err := request.RequireString("text")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	// ① 글자 수
+	runeCnt := len([]rune(text))
+	charLine := fmt.Sprintf("🔢 글자 수: %d자", runeCnt)
+
+	// ② 맞춤법
+	grammarLine, err := kospellReport(text)
+	if err != nil {
+		return nil, err // Returning a top-level error
+	}
+
+	// ③ 종합 메시지
+	var sb strings.Builder
+	sb.WriteString(charLine)
+	sb.WriteString("\n\n")
+	sb.WriteString(grammarLine)
+
+	return mcp.NewToolResultText(sb.String()), nil
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -113,11 +142,4 @@ func kospellReport(text string) (string, error) {
 		}
 	}
 	return sb.String(), nil
-}
-
-// must is a tiny helper to crash fast on init-time errors.
-func must(err error) {
-	if err != nil {
-		log.Fatal(err)
-	}
 }
