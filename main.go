@@ -51,6 +51,16 @@ func main() {
 	)
 	s.AddTool(resumeReviewTool, resumeReviewHandler)
 
+	// 4) 로마자 변환
+	romanizeTool := mcp.NewTool("romanize_korean",
+		mcp.WithDescription("Romanize Korean text based on the National Institute of Korean Language rules."),
+		mcp.WithString("text",
+			mcp.Required(),
+			mcp.Description("Korean text to romanize"),
+		),
+	)
+	s.AddTool(romanizeTool, romanizeKoreanHandler)
+
 	// Start the stdio server
 	if err := server.ServeStdio(s); err != nil {
 		log.Fatalf("Server error: %v\n", err)
@@ -112,6 +122,17 @@ func resumeReviewHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp
 	return mcp.NewToolResultText(sb.String()), nil
 }
 
+func romanizeKoreanHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	text, err := request.RequireString("text")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	romanizedText := Romanize(text)
+
+	return mcp.NewToolResultText(romanizedText), nil
+}
+
 // ─────────────────────────────────────────────────────────────
 // Helpers
 
@@ -142,4 +163,133 @@ func kospellReport(text string) (string, error) {
 		}
 	}
 	return sb.String(), nil
+}
+
+// ─────────────────────────────────────────────────────────────
+// Romanization
+
+const (
+	hangulStart = 0xAC00
+	hangulEnd   = 0xD7A3
+	choCount    = 19
+	jungCount   = 21
+	jongCount   = 28
+)
+
+var (
+	choTable  = []string{"g", "kk", "n", "d", "tt", "r", "m", "b", "pp", "s", "ss", "", "j", "jj", "ch", "k", "t", "p", "h"}
+	jungTable = []string{"a", "ae", "ya", "yae", "eo", "e", "yeo", "ye", "o", "wa", "wae", "oe", "yo", "u", "wo", "we", "wi", "yu", "eu", "ui", "i"}
+	jongTable = []string{"", "g", "kk", "gs", "n", "nj", "nh", "d", "l", "lg", "lm", "lb", "ls", "lt", "lp", "lh", "m", "b", "bs", "s", "ss", "ng", "j", "ch", "k", "t", "p", "h"}
+	// Representative sounds for final consonants when not followed by a vowel
+	jongTerminalTable = []string{"", "k", "k", "k", "n", "n", "n", "t", "l", "k", "m", "p", "l", "t", "p", "t", "m", "p", "p", "t", "t", "ng", "t", "t", "k", "t", "p", "h"}
+)
+
+// hangulSyllable represents the phonetic components of a Hangul character.
+type hangulSyllable struct {
+	cho, jung, jong int
+	isHangul        bool
+	original        rune
+}
+
+// Romanize converts Korean text to Roman letters based on the official NIKL rules.
+// It uses a multi-pass approach to handle complex phonetic assimilation rules.
+func Romanize(text string) string {
+	runes := []rune(text)
+	n := len(runes)
+	if n == 0 {
+		return ""
+	}
+
+	syllables := make([]hangulSyllable, n)
+
+	// Pass 1: Decompose all runes into their Jamo components.
+	for i, r := range runes {
+		if r >= hangulStart && r <= hangulEnd {
+			code := int(r - hangulStart)
+			syllables[i] = hangulSyllable{
+				cho:      code / (jungCount * jongCount),
+				jung:     (code % (jungCount * jongCount)) / jongCount,
+				jong:     code % jongCount,
+				isHangul: true,
+				original: r,
+			}
+		} else {
+			syllables[i] = hangulSyllable{isHangul: false, original: r}
+		}
+	}
+
+	// Pass 2: Apply sound change rules by modifying the Jamo components.
+	for i := 0; i < n-1; i++ {
+		s1 := &syllables[i]
+		s2 := &syllables[i+1]
+
+		if !s1.isHangul || !s2.isHangul || s1.jong == 0 {
+			continue
+		}
+
+		// Rule: Palatalization (e.g., 같이 -> gachi, 해돋이 -> haedoji)
+		if (s1.jong == 7 || s1.jong == 25) && s2.cho == 11 && s2.jung == 20 { // ㄷ, ㅌ + ㅣ
+			s1.jong = 0 // Final consonant of s1 is removed
+			s2.cho = 14 // Initial of s2 becomes ㅊ
+			continue
+		}
+
+		// Rules for when the next syllable starts with a consonant
+		if s2.cho != 11 { // if next is not vowel-initial 'ㅇ'
+			// Rule: Nasalization (e.g., 백마 -> baengma, 신문로 -> sinmunno)
+			if s2.cho == 2 || s2.cho == 6 { // next initial is ㄴ or ㅁ
+				switch s1.jong {
+				case 1, 2, 24: // ㄱ, ㄲ, ㅋ -> ㅇ
+					s1.jong = 21
+				case 7, 19, 20, 22, 23, 25: // ㄷ, ㅅ, ㅆ, ㅈ, ㅊ, ㅌ -> ㄴ
+					s1.jong = 4
+				case 17, 26: // ㅂ, ㅍ -> ㅁ
+					s1.jong = 16
+				}
+			}
+
+			// Rule: 'ㄹ' Assimilation (e.g., 신라 -> Silla, 별내 -> Byeollae)
+			if s1.jong == 4 && s2.cho == 5 { // ㄴ + ㄹ -> ㄹ + ㄹ
+				s1.jong = 8
+				s2.cho = 5 // remains ㄹ
+			} else if s1.jong == 8 && s2.cho == 2 { // ㄹ + ㄴ -> ㄹ + ㄹ
+				s2.cho = 5
+			}
+		}
+	}
+
+	// Pass 3: Build the final Romanized string from the modified syllables.
+	var sb strings.Builder
+	for i := 0; i < n; i++ {
+		s := syllables[i]
+		if !s.isHangul {
+			sb.WriteRune(s.original)
+			continue
+		}
+
+		// Handle previous syllable's final for liaison
+		if i > 0 {
+			prev := syllables[i-1]
+			if prev.isHangul && prev.jong != 0 && s.cho == 11 { // Liaison
+				// A final from previous syllable moves here
+				sb.WriteString(jongTable[prev.jong])
+			}
+		}
+
+		sb.WriteString(choTable[s.cho])
+		sb.WriteString(jungTable[s.jung])
+
+		// Write final consonant if it doesn't cause liaison
+		if s.jong != 0 {
+			nextIsVowelInitial := false
+			if i+1 < n && syllables[i+1].isHangul && syllables[i+1].cho == 11 {
+				nextIsVowelInitial = true
+			}
+			if !nextIsVowelInitial {
+				sb.WriteString(jongTerminalTable[s.jong])
+			}
+		}
+	}
+
+	return sb.String()
 }
